@@ -1,380 +1,244 @@
-require('dotenv').config();
 const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
 const cors = require('cors');
-const mongoose = require('mongoose');
+
 const app = express();
-const http = require('http').createServer(app);
-const io = require('socket.io')(http, {
-  cors: {
-    origin: "http://localhost:3000",
-    methods: ["GET", "POST"]
-  }
-});
-const { OAuth2Client } = require('google-auth-library');
-const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
-const jwt = require('jsonwebtoken');
-const Hospital = require('./models/hospital');
 
-// Connect to MongoDB
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('Connected to MongoDB'))
-  .catch(err => console.error('MongoDB connection error:', err));
-
-// Enable CORS
+// Update CORS configuration
 app.use(cors());
 app.use(express.json());
 
-// Store connected hospitals
+const server = http.createServer(app);
+
+// Update Socket.IO configuration
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"],
+    allowedHeaders: ["*"],
+    credentials: false
+  },
+  transports: ['polling', 'websocket'],
+  allowEIO3: true,
+  pingTimeout: 30000,
+  pingInterval: 10000
+});
+
+// Store all registered hospitals (persistent storage)
+let registeredHospitals = new Map();
+
+// Store connected hospitals and their active requests
 const connectedHospitals = new Map();
+const activeRequests = new Map();
 
-// Google Authentication Middleware
-const verifyGoogleToken = async (req, res, next) => {
+// Add hospital registration endpoint with error handling
+app.post('/register-hospital', async (req, res) => {
   try {
-    const { token } = req.body;
-    const ticket = await client.verifyIdToken({
-      idToken: token,
-      audience: process.env.GOOGLE_CLIENT_ID
-    });
-    const payload = ticket.getPayload();
-    req.user = payload;
-    next();
-  } catch (error) {
-    console.error('Google Auth Error:', error);
-    res.status(401).json({ error: 'Invalid token' });
-  }
-};
-
-// Google Authentication Routes
-app.post('/api/auth/google', verifyGoogleToken, async (req, res) => {
-  try {
-    const { email, name, picture } = req.user;
-    
-    // Check if hospital already exists
-    let hospital = await Hospital.findOne({ email });
-    
-    if (!hospital) {
-      // Create new hospital
-      hospital = new Hospital({
-        email,
-        name,
-        profilePicture: picture,
-        isGoogleAuth: true
+    const hospitalData = req.body;
+    if (!hospitalData || !hospitalData.id) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Invalid hospital data' 
       });
-      await hospital.save();
     }
-
-    // Generate JWT token
-    const token = jwt.sign(
-      { hospitalId: hospital._id },
-      process.env.JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-
-    res.json({
-      token,
-      hospital: {
-        id: hospital._id,
-        name: hospital.name,
-        email: hospital.email,
-        profilePicture: hospital.profilePicture
-      }
-    });
-  } catch (error) {
-    console.error('Google Auth Error:', error);
-    res.status(500).json({ error: 'Authentication failed' });
-  }
-});
-
-// Regular Authentication Routes
-app.post('/api/auth/register', async (req, res) => {
-  try {
-    const { name, email, password, city, contact } = req.body;
     
-    // Check if hospital already exists
-    const existingHospital = await Hospital.findOne({ email });
-    if (existingHospital) {
-      return res.status(400).json({ error: 'Hospital already exists' });
-    }
-
-    // Create new hospital
-    const hospital = new Hospital({
-      name,
-      email,
-      password, // Note: In production, hash the password before saving
-      city,
-      contact,
-      isGoogleAuth: false
-    });
-
-    await hospital.save();
-
-    // Generate JWT token
-    const token = jwt.sign(
-      { hospitalId: hospital._id },
-      process.env.JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-
-    res.json({
-      token,
-      hospital: {
-        id: hospital._id,
-        name: hospital.name,
-        email: hospital.email
-      }
-    });
-  } catch (error) {
-    console.error('Registration Error:', error);
-    res.status(500).json({ error: 'Registration failed' });
-  }
-});
-
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
+    registeredHospitals.set(hospitalData.id, hospitalData);
+    console.log('New hospital registered:', hospitalData);
     
-    // Find hospital
-    const hospital = await Hospital.findOne({ email });
-    if (!hospital) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    // Check password (Note: In production, use proper password comparison)
-    if (hospital.password !== password) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    // Generate JWT token
-    const token = jwt.sign(
-      { hospitalId: hospital._id },
-      process.env.JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-
-    res.json({
-      token,
-      hospital: {
-        id: hospital._id,
-        name: hospital.name,
-        email: hospital.email
-      }
+    res.json({ 
+      success: true, 
+      message: 'Hospital registered successfully',
+      data: hospitalData 
     });
   } catch (error) {
-    console.error('Login Error:', error);
-    res.status(500).json({ error: 'Login failed' });
+    console.error('Registration error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Internal server error' 
+    });
   }
 });
 
-// Socket.IO connection handling
+// Get registered hospitals endpoint
+app.get('/registered-hospitals', (req, res) => {
+  const hospitals = Array.from(registeredHospitals.values());
+  res.json(hospitals);
+});
+
 io.on('connection', (socket) => {
-  console.log('New Socket.IO connection');
+  console.log('A client connected:', socket.id);
 
-  socket.on('register', (hospital) => {
-    handleHospitalRegistration(socket, hospital);
-  });
-
-  socket.on('connectionRequest', (data) => {
-    handleConnectionRequest(data);
-  });
-
-  socket.on('connectionAccepted', (data) => {
-    handleConnectionAccepted(data);
-  });
-
-  socket.on('connectionRejected', (data) => {
-    handleConnectionRejected(data);
-  });
-
-  socket.on('send_request', (data) => {
-    handleEmergencyRequest(data);
-  });
-
-  socket.on('accept_request', (data) => {
-    handleRequestAcceptance(data);
-  });
-
-  socket.on('send_message', (data) => {
-    handleMessage(data);
-  });
-
-  socket.on('disconnect', () => {
-    handleHospitalDisconnection(socket);
-  });
-});
-
-function handleHospitalRegistration(socket, hospital) {
-  // Store hospital connection
-  connectedHospitals.set(hospital.id, {
-    socket,
-    hospital,
-    connected: false
-  });
-
-  // Send updated hospital list to all connected hospitals
-  broadcastHospitalList();
-
-  // Send confirmation to the registering hospital
-  socket.emit('registrationConfirmed', { hospital });
-}
-
-function handleConnectionRequest(data) {
-  const { fromHospitalId, toHospitalId } = data;
-  const targetHospital = connectedHospitals.get(toHospitalId);
-
-  if (targetHospital) {
-    const sourceHospital = connectedHospitals.get(fromHospitalId);
-    targetHospital.socket.emit('connectionRequest', {
-      hospital: sourceHospital.hospital
-    });
-  }
-}
-
-function handleConnectionAccepted(data) {
-  const { fromHospitalId, toHospitalId } = data;
-  const sourceHospital = connectedHospitals.get(fromHospitalId);
-  const targetHospital = connectedHospitals.get(toHospitalId);
-
-  if (sourceHospital && targetHospital) {
-    // Update connection status
-    sourceHospital.connected = true;
-    targetHospital.connected = true;
-
-    // Notify both hospitals
-    sourceHospital.socket.emit('connectionAccepted', {
-      hospital: targetHospital.hospital
+  // Handle hospital connection
+  socket.on('hospital_connected', (hospital) => {
+    console.log('Hospital connected:', hospital.name, hospital.id);
+    
+    // Store hospital data with socket ID
+    connectedHospitals.set(socket.id, {
+      ...hospital,
+      socketId: socket.id,
+      status: 'online'
     });
 
-    targetHospital.socket.emit('connectionAccepted', {
-      hospital: sourceHospital.hospital
-    });
+    // Join hospital-specific room
+    socket.join(`hospital_${hospital.id}`);
+    socket.join('all_hospitals'); // Join broadcast room
+
+    // Send existing active requests to newly connected hospital
+    const existingRequests = Array.from(activeRequests.values());
+    if (existingRequests.length > 0) {
+      socket.emit('existing_requests', existingRequests);
+    }
 
     // Broadcast updated hospital list
     broadcastHospitalList();
-  }
-}
+  });
 
-function handleConnectionRejected(data) {
-  const { fromHospitalId, toHospitalId } = data;
-  const sourceHospital = connectedHospitals.get(fromHospitalId);
-  const targetHospital = connectedHospitals.get(toHospitalId);
-
-  if (sourceHospital && targetHospital) {
-    // Notify both hospitals
-    sourceHospital.socket.emit('connectionRejected', {
-      hospital: targetHospital.hospital
-    });
-
-    targetHospital.socket.emit('connectionRejected', {
-      hospital: sourceHospital.hospital
-    });
-  }
-}
-
-function handleHospitalDisconnection(socket) {
-  let disconnectedHospitalId = null;
-  
-  // Find and remove the disconnected hospital
-  for (const [hospitalId, hospital] of connectedHospitals.entries()) {
-    if (hospital.socket === socket) {
-      disconnectedHospitalId = hospitalId;
-      connectedHospitals.delete(hospitalId);
-      break;
+  // Handle emergency requests
+  socket.on('send_request', ({ to, request }) => {
+    const fromHospital = connectedHospitals.get(socket.id);
+    if (!fromHospital) {
+      console.log('Hospital not found for socket:', socket.id);
+      return;
     }
-  }
 
-  if (disconnectedHospitalId) {
-    // Notify all connected hospitals about the disconnection
-    broadcastHospitalList();
+    console.log('Processing request from:', fromHospital.name);
     
-    // Notify connected hospitals about the disconnection
-    for (const [hospitalId, hospital] of connectedHospitals.entries()) {
-      if (hospital.connected) {
-        hospital.socket.emit('hospitalDisconnected', {
-          hospitalId: disconnectedHospitalId
-        });
-      }
-    }
-  }
-}
+    // Store the request with the sender's information
+    const enrichedRequest = {
+      ...request,
+      from: fromHospital,
+      timestamp: new Date().toISOString()
+    };
+    activeRequests.set(request.id, enrichedRequest);
 
-function handleEmergencyRequest(data) {
-  const { to, request } = data;
-  
-  if (to === 'broadcast') {
-    // Broadcast to all connected hospitals
-    connectedHospitals.forEach(hospital => {
-      if (hospital.socket.connected) {
-        hospital.socket.emit('new_request', request);
-      }
+    // Broadcast to all hospitals in the broadcast room
+    socket.to('all_hospitals').emit('request_received', {
+      request: enrichedRequest,
+      from: fromHospital
     });
-  } else {
-    // Send to specific hospital
-    const targetHospital = connectedHospitals.get(to);
-    if (targetHospital && targetHospital.socket.connected) {
-      targetHospital.socket.emit('new_request', request);
-    }
-  }
-}
 
-function handleRequestAcceptance(data) {
-  const { requestId, to, hospital } = data;
-  const targetHospital = connectedHospitals.get(to);
-  
-  if (targetHospital && targetHospital.socket.connected) {
-    targetHospital.socket.emit('request_accepted', {
-      requestId,
-      hospital
+    // Send confirmation back to sender
+    socket.emit('request_sent_confirmation', {
+      request: enrichedRequest
     });
-  }
-}
 
-function handleMessage(data) {
-  const { to, message } = data;
-  const targetHospital = connectedHospitals.get(to);
-  
-  if (targetHospital && targetHospital.socket.connected) {
-    targetHospital.socket.emit('new_message', message);
-  }
-}
+    console.log('Request broadcast complete. Active requests:', activeRequests.size);
+  });
 
-function broadcastHospitalList() {
-  const hospitalList = Array.from(connectedHospitals.values()).map(h => ({
-    id: h.hospital.id,
-    name: h.hospital.name,
-    city: h.hospital.city,
-    contact: h.hospital.contact,
-    location: h.hospital.location,
-    connected: h.connected
-  }));
+  // Handle request acceptance
+  socket.on('accept_request', ({ requestId, to, hospital }) => {
+    const fromHospital = connectedHospitals.get(socket.id);
+    if (!fromHospital) return;
 
-  // Broadcast to all connected hospitals
-  connectedHospitals.forEach(hospital => {
-    if (hospital.socket.connected) {
-      hospital.socket.emit('hospitalList', { hospitals: hospitalList });
+    console.log('Request accepted by:', fromHospital.name);
+
+    // Update request status
+    const request = activeRequests.get(requestId);
+    if (request) {
+      request.status = 'accepted';
+      request.acceptedBy = fromHospital;
+      request.acceptedAt = new Date().toISOString();
+
+      // Notify all hospitals about the status update
+      io.to('all_hospitals').emit('request_status_updated', {
+        requestId,
+        status: 'accepted',
+        acceptedBy: fromHospital
+      });
+
+      // Notify the requesting hospital specifically
+      io.to(`hospital_${to}`).emit('request_accepted', {
+        requestId,
+        hospital: fromHospital
+      });
     }
   });
+
+  // Handle messages
+  socket.on('send_message', ({ to, message }) => {
+    const fromHospital = connectedHospitals.get(socket.id);
+    if (!fromHospital) return;
+
+    const enrichedMessage = {
+      ...message,
+      from: fromHospital,
+      timestamp: new Date().toISOString()
+    };
+
+    // Send to specific hospital room
+    io.to(`hospital_${to}`).emit('message_received', enrichedMessage);
+    
+    // Also send confirmation to sender
+    socket.emit('message_sent_confirmation', enrichedMessage);
+  });
+
+  // Handle video calls
+  socket.on('call_initiate', ({ to, from, signal }) => {
+    io.to(`hospital_${to}`).emit('call_incoming', { from, signal });
+  });
+
+  socket.on('call_accept', ({ to, signal }) => {
+    const fromHospital = connectedHospitals.get(socket.id);
+    if (fromHospital) {
+      io.to(`hospital_${to}`).emit('call_accepted', {
+        signal,
+        hospital: fromHospital
+      });
+    }
+  });
+
+  socket.on('call_reject', ({ to, from }) => {
+    io.to(`hospital_${to}`).emit('call_rejected', { from });
+  });
+
+  // Handle disconnection
+  socket.on('disconnect', () => {
+    const hospital = connectedHospitals.get(socket.id);
+    if (hospital) {
+      console.log('Hospital disconnected:', hospital.name);
+      socket.leave(`hospital_${hospital.id}`);
+      socket.leave('all_hospitals');
+      connectedHospitals.delete(socket.id);
+      broadcastHospitalList();
+    }
+  });
+});
+
+// Helper function to broadcast hospital list
+function broadcastHospitalList() {
+  const onlineHospitals = Array.from(connectedHospitals.values())
+    .map(({ socketId, ...hospital }) => ({
+      ...hospital,
+      isOnline: true
+    }));
+
+  // Combine with registered hospitals that are offline
+  const allHospitals = Array.from(registeredHospitals.values())
+    .map(hospital => {
+      const isOnline = onlineHospitals.some(h => h.id === hospital.id);
+      return {
+        ...hospital,
+        isOnline
+      };
+    });
+  
+  console.log('Broadcasting updated hospital list:', allHospitals.length, 'hospitals');
+  io.emit('hospitals_updated', allHospitals);
 }
 
-// API Routes
-app.post('/api/hospitals/register', (req, res) => {
-  const { hospital } = req.body;
-  // Handle hospital registration
-  res.json({ success: true, message: 'Hospital registered successfully' });
-});
+// Clean up old requests periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, request] of activeRequests) {
+    const requestTime = new Date(request.timestamp).getTime();
+    if (now - requestTime > 24 * 60 * 60 * 1000) { // 24 hours
+      activeRequests.delete(id);
+    }
+  }
+}, 60 * 60 * 1000); // Check every hour
 
-app.get('/api/hospitals', (req, res) => {
-  const hospitalList = Array.from(connectedHospitals.values()).map(h => ({
-    id: h.hospital.id,
-    name: h.hospital.name,
-    city: h.hospital.city,
-    contact: h.hospital.contact,
-    location: h.hospital.location,
-    connected: h.connected
-  }));
-  res.json(hospitalList);
-});
-
-const PORT = process.env.PORT || 5000;
-http.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+const PORT = process.env.PORT || 3001;
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 }); 
